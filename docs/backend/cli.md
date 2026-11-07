@@ -199,12 +199,30 @@ agentero discover arxiv -c cs.LG --top 20 --max-candidates 200 --json
 | `--max-candidates` | 排序前抓取的候选上限（默认 100，封顶 200） |
 | `--out` | 把完整短名单 JSON 写到文件 |
 | `--no-dedup` | 关闭「已入库去重」 |
+| `--no-seen` | 关闭「已推送台账」（跨轮次去重），不读也不写 |
+| `--seen FILE` | 指定台账文件路径（默认见下文） |
 | `--embed-base` / `--embed-model` | 给 OpenAI 兼容 embeddings Base URL + 模型 id，启用**可选**语义加权；key 读 `AGENTERO_EMBEDDING_API_KEY`（不走 argv） |
 | `--semantic-weight` | 语义余弦加到词法分的权重（默认 1.0） |
 
 - **至少给一个 `--keyword` 或 `--category`**，否则报 `usage`（只给日期会扫无界切片）。
 - 打分默认纯词法、可复现、离线可跑；`matches` 里的 `field` / `count` / `weight` / `contribution` 就是「为什么推它」。
-- **已入库去重**：解析到 vault 时，候选里 arXiv id 已在 catalog 的会被**排序前**剔除（`excluded` 计数）；命令仍保持 vault-free——解析不到 vault 就静默跳过去重，只有显式传了无效 `--vault` 才报错。`--no-dedup` 可关闭。
+- **已入库去重**：解析到 vault 时，候选的**身份键**（arXiv id 或 DOI，均归一化）已在 catalog 的会在**排序前**剔除（`excluded` 计数）；命令仍保持 vault-free——解析不到 vault 就静默跳过去重，只有显式传了无效 `--vault` 才报错。`--no-dedup` 可关闭。
+- **已推送台账（跨轮次去重，默认开启）**：雷达场景下同一篇论文常以不同关键词分开跑（`dance` 与 `choreography`），catalog 里没有、上一轮却已推过的会重复进短名单。台账是纯 JSONL 文件，每行一条已推送条目（`title` / `arxivId` / `doi` / `source` / `at`）：
+  - 路径优先级：`--seen FILE` > `<vault>/.agentero/discovery/seen.jsonl` > XDG 数据目录（`$XDG_DATA_HOME/agentero/discovery/seen.jsonl`，无 vault 的 headless 机器落这里）。
+  - 每次运行**排序前**按身份键（arXiv id、DOI、归一化标题，任一命中即剔除）过滤，剔除数计入 `seenExcluded`；运行结束后本次短名单整体追加进台账（`recorded` 计数），坏行跳过不中断。
+  - 匹配按身份键而非精确 arXiv id，所以**跨源**也成立：期刊 RSS 条目（只有 DOI / 标题、没有 arXiv id）记进台账后，它的 arXiv 预印本下一轮同样会被剔除；反向亦然。
+  - 台账可手工 append / 编辑（任何脚本都能写），也可用子命令管理：
+    ```bash
+    # 查看（新→旧）
+    agentero discover seen list --limit 20 --json
+    # 手工登记一条（典型：雷达推过的期刊 RSS 条目）
+    agentero discover seen add -t "Dance and Choreography: A Review" --doi 10.1000/dance.2026.1 --source feed --json
+    # 移除某条（按 arXiv id / DOI / 标题，归一化匹配）
+    agentero discover seen forget 2401.12345 --json
+    # 清空（破坏性，需要 --yes）
+    agentero discover seen clear --yes --json
+    ```
+  - 台账记的是「已推过」，不是「不感兴趣」：误伤时用 `forget` / `clear` 恢复，不用等 catalog。
 - **可选语义排序**：给了 `--embed-base` + `--embed-model` 后，把关键词的 embedding 与候选 embedding 的余弦按 `--semantic-weight` 加到词法分上（`matches` 里出现 `field: "semantic"` 一项）。端点失败**不报错**，降级为纯词法并在 `semanticError` / 文本末行提示。默认不启用，词法仍是基线。
 - 输出是可直接消费的短名单（`_shortlist.json` 的收敛版）；Agent 拿到后自行判断题相关性，再走 `import id` 入库。
 - 与桌面广场的 arXiv Daily **不同**：后者是「读我的库 → 今天该读什么」的库画像 embedding 排序，依赖 catalog 与 embedding 端点；本命令是 query-first、零依赖，供 headless / 管线使用。

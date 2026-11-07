@@ -124,6 +124,26 @@ const TABLE: &[OpClassification] = &[
         OpPermission::Unspecified,
     ),
     spec(
+        "discover.seen.list",
+        OpStability::Internal,
+        OpPermission::Unspecified,
+    ),
+    spec(
+        "discover.seen.add",
+        OpStability::Internal,
+        OpPermission::Unspecified,
+    ),
+    spec(
+        "discover.seen.forget",
+        OpStability::Internal,
+        OpPermission::Unspecified,
+    ),
+    spec(
+        "discover.seen.clear",
+        OpStability::Internal,
+        OpPermission::Unspecified,
+    ),
+    spec(
         "export.bib",
         OpStability::Internal,
         OpPermission::Unspecified,

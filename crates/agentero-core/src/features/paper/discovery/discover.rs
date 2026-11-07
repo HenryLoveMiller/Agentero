@@ -16,6 +16,7 @@ use std::path::Path;
 
 use crate::error::AppError;
 use crate::features::paper::discovery::embeddings::{self, EmbeddingConfig};
+use crate::features::paper::discovery::identity::{self, tagged_keys};
 use crate::features::scholar_api::sources::arxiv;
 use crate::features::scholar_api::ApiPaper;
 
@@ -80,6 +81,9 @@ pub struct ScoreTerm {
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverItem {
     pub arxiv_id: String,
+    /// DOI when the source provides one (arXiv Atom usually does not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doi: Option<String>,
     pub title: String,
     #[serde(rename = "abstract")]
     pub abstract_text: String,
@@ -89,6 +93,26 @@ pub struct DiscoverItem {
     pub score: f32,
     /// Non-empty matchers, highest-contribution first is not guaranteed.
     pub matches: Vec<ScoreTerm>,
+}
+
+/// Candidate keys to drop before ranking, partitioned by origin so the
+/// result can report the two filters separately.
+///
+/// Keys are tagged identity keys (see [`crate::features::paper::discovery::identity`]):
+/// `arxiv:…`, `doi:…` or `title:…`. A candidate is dropped when *any* of its
+/// own keys is present in the corresponding set.
+#[derive(Debug, Clone, Default)]
+pub struct Exclusion {
+    /// Identity keys of papers already in the library catalog.
+    pub known: HashSet<String>,
+    /// Identity keys of entries a previous round already pushed (ledger).
+    pub seen: HashSet<String>,
+}
+
+impl Exclusion {
+    pub fn is_empty(&self) -> bool {
+        self.known.is_empty() && self.seen.is_empty()
+    }
 }
 
 /// Result of one discovery run.
@@ -102,8 +126,12 @@ pub struct DiscoverResult {
     pub search_query: String,
     /// Candidates fetched before novelty filtering.
     pub candidates_scanned: usize,
-    /// Candidates dropped because they are already known (e.g. in the library).
+    /// Candidates dropped because they are already known (in the library).
     pub excluded: usize,
+    /// Candidates dropped because a previous round already pushed them
+    /// (the "pushed" ledger).
+    #[serde(default)]
+    pub seen_excluded: usize,
     pub computed_at: String,
     /// Set when semantic ranking was requested but the endpoint failed; the
     /// result then degrades to lexical-only instead of erroring.
@@ -114,19 +142,23 @@ pub struct DiscoverResult {
 
 /// Fetch + rank arXiv candidates for `query`.
 ///
-/// `exclude_ids` drops candidates already known to the caller (typically the
-/// library's arXiv ids) *before* ranking, so the shortlist fills with fresh
-/// papers instead of being eaten by a truncated `top`. Pass an empty set for a
-/// pure network discovery run.
+/// `exclude` drops candidates already known to the caller *before* ranking,
+/// so the shortlist fills with fresh papers instead of being eaten by a
+/// truncated `top`: `known` for the library catalog, `seen` for entries a
+/// previous round already pushed (the ledger). Matching is identity-key
+/// based (arXiv id, DOI or normalized title), so a journal RSS entry
+/// recorded in the ledger also drops its arXiv preprint. Pass
+/// [`Exclusion::default()`] for a pure network discovery run.
 ///
 /// `embedding`, when supplied, adds an optional cosine-similarity term to the
 /// lexical score (see [`DiscoverQuery::semantic_weight`]); if that call fails
 /// the run degrades to lexical-only and records `semantic_error`.
 ///
-/// Network-only otherwise: does not touch the Vault or catalog.
+/// Network-only otherwise: does not touch the Vault, catalog or ledger — the
+/// caller owns loading and updating them.
 pub async fn discover_arxiv(
     query: &DiscoverQuery,
-    exclude_ids: &HashSet<String>,
+    exclude: &Exclusion,
     embedding: Option<&EmbeddingConfig>,
 ) -> Result<DiscoverResult, AppError> {
     let search_query = build_search_query(query)?;
@@ -139,7 +171,7 @@ pub async fn discover_arxiv(
     let papers = arxiv::query_atom(&search_query, 0, max_candidates).await?;
     let candidates_scanned = papers.len();
 
-    let (kept, excluded) = drop_known(papers, exclude_ids);
+    let (kept, excluded, seen_excluded) = drop_known(papers, exclude);
     let terms = normalize_terms(&query.keywords);
     let mut items = score_lexical(kept, &terms);
 
@@ -162,6 +194,7 @@ pub async fn discover_arxiv(
         search_query,
         candidates_scanned,
         excluded,
+        seen_excluded,
         computed_at: crate::time::now_rfc3339_millis(),
         semantic_error,
         items,
@@ -226,34 +259,61 @@ fn embed_input(title: &str, abstract_text: &str) -> String {
     joined.chars().take(MAX_EMBED_CHARS).collect()
 }
 
-/// Split candidates into "kept" and "already known" (dropped). Papers with no
-/// arXiv id are always kept — novelty cannot be judged.
-fn drop_known(papers: Vec<ApiPaper>, exclude: &HashSet<String>) -> (Vec<ApiPaper>, usize) {
+/// Split candidates into "kept", "already in the library" and "already
+/// pushed" (dropped). A candidate is dropped when any of its identity keys
+/// (arXiv id, DOI, normalized title) is in the corresponding exclusion set;
+/// the library filter wins the attribution. Candidates whose keys are all
+/// unnormalizable are always kept — novelty cannot be judged.
+fn drop_known(papers: Vec<ApiPaper>, exclude: &Exclusion) -> (Vec<ApiPaper>, usize, usize) {
     if exclude.is_empty() {
-        return (papers, 0);
+        return (papers, 0, 0);
     }
     let mut kept = Vec::with_capacity(papers.len());
-    let mut dropped = 0usize;
+    let mut excluded = 0usize;
+    let mut seen_excluded = 0usize;
     for paper in papers {
-        match paper.identifiers.arxiv_id.as_deref() {
-            Some(id) if exclude.contains(id) => dropped += 1,
-            _ => kept.push(paper),
+        let keys = tagged_keys(
+            paper.identifiers.arxiv_id.as_deref(),
+            paper.identifiers.doi.as_deref(),
+            &paper.title,
+        );
+        if keys.iter().any(|key| exclude.known.contains(key)) {
+            excluded += 1;
+            continue;
         }
+        if keys.iter().any(|key| exclude.seen.contains(key)) {
+            seen_excluded += 1;
+            continue;
+        }
+        kept.push(paper);
     }
-    (kept, dropped)
+    (kept, excluded, seen_excluded)
 }
 
-/// arXiv ids already present in the vault's catalog, for novelty filtering.
+/// Identity keys (arXiv ids + DOIs) of papers already in the vault's catalog,
+/// for novelty filtering.
 ///
-/// Returns an empty set when the catalog has no arXiv papers.
-pub fn known_arxiv_ids(vault_root: &Path) -> Result<HashSet<String>, AppError> {
+/// DOIs are included so a journal version in the library also matches its
+/// arXiv preprint candidate (and vice versa). Titles are deliberately not
+/// included: a permanent library should never hide a paper on a fuzzy match.
+///
+/// Returns an empty set when the catalog has no arXiv/DOI papers.
+pub fn known_ids(vault_root: &Path) -> Result<HashSet<String>, AppError> {
     let papers = crate::features::paper::catalog::papers::list_all_unique_by_id(vault_root)?;
-    Ok(papers
-        .into_iter()
-        .filter_map(|paper| paper.arxiv_id)
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
-        .collect())
+    let mut keys = HashSet::new();
+    for paper in papers {
+        if let Some(id) = paper
+            .arxiv_id
+            .as_deref()
+            .and_then(identity::normalize_arxiv_id)
+        {
+            keys.insert(format!("arxiv:{id}"));
+        }
+        if let Some(doi) = paper.doi.as_deref().and_then(identity::normalize_doi) {
+            keys.insert(format!("doi:{doi}"));
+        }
+    }
+    Ok(keys)
 }
 
 /// Compose the arXiv `search_query` expression from keywords / categories /
@@ -385,6 +445,7 @@ fn score_lexical(papers: Vec<ApiPaper>, terms: &[String]) -> Vec<DiscoverItem> {
 
             DiscoverItem {
                 arxiv_id: paper.identifiers.arxiv_id.unwrap_or_default(),
+                doi: paper.identifiers.doi.clone(),
                 title,
                 abstract_text,
                 url: paper.urls.landing.unwrap_or_default(),
@@ -554,15 +615,87 @@ mod tests {
             paper("known", "a", "", "2026-08-01T00:00:00Z"),
             paper("fresh", "b", "", "2026-08-01T00:00:00Z"),
         ];
-        let exclude: HashSet<String> = ["known".to_string()].into_iter().collect();
-        let (kept, dropped) = drop_known(candidates, &exclude);
-        assert_eq!(dropped, 1);
+        let exclude = Exclusion {
+            known: ["arxiv:known".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let (kept, dropped, seen_dropped) = drop_known(candidates, &exclude);
+        assert_eq!((dropped, seen_dropped), (1, 0));
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].identifiers.arxiv_id.as_deref(), Some("fresh"));
 
-        // Empty exclude is a no-op.
+        // Empty exclusion is a no-op.
         let single = vec![paper("x", "t", "", "2026-08-01T00:00:00Z")];
-        let (kept, dropped) = drop_known(single, &HashSet::new());
-        assert_eq!((kept.len(), dropped), (1, 0));
+        let (kept, dropped, seen_dropped) = drop_known(single, &Exclusion::default());
+        assert_eq!((kept.len(), dropped, seen_dropped), (1, 0, 0));
+    }
+
+    #[test]
+    fn drop_known_matches_ledger_by_arxiv_id_version_insensitive() {
+        // An entry recorded with a version-suffixed id is stored normalized,
+        // so a candidate carrying the bare id still matches.
+        let mut ledger = crate::features::paper::discovery::seen::SeenLedger::new();
+        ledger.add([crate::features::paper::discovery::seen::SeenEntry {
+            title: "recorded under a different phrasing".to_string(),
+            arxiv_id: Some("arXiv:2401.12345v2".to_string()),
+            doi: None,
+            source: Some("arxiv".to_string()),
+            at: "2026-08-01T00:00:00.000Z".to_string(),
+        }]);
+        let candidates = vec![paper("2401.12345", "t", "", "2026-08-01T00:00:00Z")];
+        let exclude = Exclusion {
+            seen: ledger.keys().clone(),
+            ..Default::default()
+        };
+        let (kept, dropped, seen_dropped) = drop_known(candidates, &exclude);
+        assert_eq!((kept.len(), dropped, seen_dropped), (0, 0, 1));
+    }
+
+    #[test]
+    fn drop_known_is_cross_source_for_journal_ledger_entries() {
+        // A journal RSS item has no arXiv id: its ledger entry matches by
+        // DOI and by normalized title. Both must drop the arXiv preprint.
+        let mut preprint = paper(
+            "2401.12345",
+            "Dance and Choreography: A Review",
+            "",
+            "2026-08-01T00:00:00Z",
+        );
+        preprint.identifiers.doi = Some("https://doi.org/10.1000/dance.2026.1".to_string());
+
+        // DOI-only ledger entry (feed item whose title the radar normalized
+        // differently is still caught by the DOI key).
+        let by_doi = Exclusion {
+            seen: ["doi:10.1000/dance.2026.1".to_string()]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let (kept, _, seen_dropped) = drop_known(vec![preprint.clone()], &by_doi);
+        assert_eq!((kept.len(), seen_dropped), (0, 1));
+
+        // Title-only ledger entry: journal title differs only in case and
+        // punctuation from the arXiv title.
+        let by_title = Exclusion {
+            seen: [
+                identity::tagged_keys(None, None, "dance and choreography — a review")[0].clone(),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let (kept, _, seen_dropped) = drop_known(vec![preprint], &by_title);
+        assert_eq!((kept.len(), seen_dropped), (0, 1));
+    }
+
+    #[test]
+    fn drop_known_attributes_library_filter_first() {
+        let candidates = vec![paper("2401.12345", "t", "", "2026-08-01T00:00:00Z")];
+        let exclude = Exclusion {
+            known: ["arxiv:2401.12345".to_string()].into_iter().collect(),
+            seen: ["arxiv:2401.12345".to_string()].into_iter().collect(),
+        };
+        let (kept, dropped, seen_dropped) = drop_known(candidates, &exclude);
+        assert_eq!((kept.len(), dropped, seen_dropped), (0, 1, 0));
     }
 }

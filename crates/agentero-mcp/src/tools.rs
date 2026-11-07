@@ -23,7 +23,6 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -568,6 +567,8 @@ struct DiscoverArxivOut {
     candidates_scanned: usize,
     /// Candidates dropped as already in the library.
     excluded: usize,
+    /// Candidates dropped as already pushed by a previous round (ledger).
+    seen_excluded: usize,
     computed_at: String,
     items: Vec<DiscoverItemOut>,
 }
@@ -579,6 +580,7 @@ impl From<discover::DiscoverResult> for DiscoverArxivOut {
             search_query: result.search_query,
             candidates_scanned: result.candidates_scanned,
             excluded: result.excluded,
+            seen_excluded: result.seen_excluded,
             computed_at: result.computed_at,
             items: result
                 .items
@@ -801,17 +803,20 @@ impl AgenteroMcp {
         &self,
         Parameters(args): Parameters<DiscoverArxivArgs>,
     ) -> Result<Json<DiscoverArxivOut>, CallToolResult> {
-        let exclude: HashSet<String> = if args.dedup {
+        let exclusion = if args.dedup {
             match self.ctrl.resolve_vault(args.vault.as_deref()) {
-                Ok(vault) => match discover::known_arxiv_ids(&vault) {
-                    Ok(ids) => ids,
+                Ok(vault) => match discover::known_ids(&vault) {
+                    Ok(known) => discover::Exclusion {
+                        known,
+                        ..Default::default()
+                    },
                     Err(e) => return Err(tool_err(e)),
                 },
                 // Discovery is vault-free; a closed vault just skips novelty.
-                Err(_) => HashSet::new(),
+                Err(_) => discover::Exclusion::default(),
             }
         } else {
-            HashSet::new()
+            discover::Exclusion::default()
         };
         let query = discover::DiscoverQuery {
             keywords: args.keywords,
@@ -822,7 +827,7 @@ impl AgenteroMcp {
             max_candidates: args.max_candidates,
             semantic_weight: None,
         };
-        match discover::discover_arxiv(&query, &exclude, None).await {
+        match discover::discover_arxiv(&query, &exclusion, None).await {
             Ok(result) => Ok(Json(DiscoverArxivOut::from(result))),
             Err(e) => Err(tool_err(e)),
         }
